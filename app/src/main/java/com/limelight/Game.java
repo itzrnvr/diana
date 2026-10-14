@@ -99,6 +99,7 @@ import android.view.View.OnSystemUiVisibilityChangeListener;
 import android.view.View.OnTouchListener;
 import android.view.ViewOutlineProvider;
 import android.view.ViewParent;
+import android.view.ViewConfiguration;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -299,10 +300,16 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean onExternelDisplay = false;
     private ImageButton floatingMenuButton;
     private ImageButton overlayToggleButton;
+    private ImageButton floatingKeyboardButton;
     private float floatingButtonDX, floatingButtonDY;
     private boolean isButtonMoving = false;
     private static final float CLICK_ACTION_THRESHOLD = 5;
     private float floatingButtonStartX, floatingButtonStartY;
+
+    // Keyboard floating button drag state
+    private float keyboardButtonDX, keyboardButtonDY;
+    private boolean isKeyboardButtonMoving = false;
+    private float keyboardButtonStartX, keyboardButtonStartY;
 
     // Zoom button drag state
     private float zoomButtonDX, zoomButtonDY;
@@ -884,6 +891,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         updateFloatingButtonVisibility(prefConfig.enableBackMenu && prefConfig.enableFloatingButton);
         initFloatingButton();
 
+        floatingKeyboardButton = findViewById(R.id.floatingKeyboardButton);
+        updateKeyboardButtonVisibility(prefConfig.enableFloatingButton);
+        initFloatingKeyboardButton();
+
         overlayToggleButton = findViewById(R.id.overlayToggleZoomButton);
         setupOverlayToggleButton();
 
@@ -1085,6 +1096,85 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                         return false;
                 }
             });
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void initFloatingKeyboardButton() {
+        // Touch listener for drag and click: tap toggles soft keyboard, drag moves.
+        // Uses the platform touch slop so finger/stylus jitter during a tap is not
+        // misread as a drag (the old fixed 5px threshold was unusable on dense panels).
+        if (floatingKeyboardButton != null) {
+            final float tapSlop = ViewConfiguration.get(this).getScaledTouchSlop();
+            floatingKeyboardButton.setOnTouchListener((view, event) -> {
+                switch (event.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                        keyboardButtonStartX = event.getRawX();
+                        keyboardButtonStartY = event.getRawY();
+                        keyboardButtonDX = view.getX() - event.getRawX();
+                        keyboardButtonDY = view.getY() - event.getRawY();
+                        isKeyboardButtonMoving = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = event.getRawX() - keyboardButtonStartX;
+                        float dy = event.getRawY() - keyboardButtonStartY;
+
+                        if (!isKeyboardButtonMoving &&
+                                (dx * dx + dy * dy > tapSlop * tapSlop)) {
+                            isKeyboardButtonMoving = true;
+                        }
+
+                        // Below the slop, absorb the jitter and leave the button in place.
+                        if (!isKeyboardButtonMoving) {
+                            return true;
+                        }
+
+                        float newX = event.getRawX() + keyboardButtonDX;
+                        float newY = event.getRawY() + keyboardButtonDY;
+
+                        if (newX < 0) newX = 0;
+                        if (newY < 0) newY = 0;
+
+                        int maxOffsetX = getWindow().getDecorView().getWidth() - view.getWidth();
+                        if (newX > maxOffsetX) {
+                            newX = maxOffsetX;
+                        }
+
+                        int maxOffsetY = getWindow().getDecorView().getHeight() - view.getHeight();
+                        if (newY > maxOffsetY) {
+                            newY = maxOffsetY;
+                        }
+
+                        view.setX(newX);
+                        view.setY(newY);
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        if (!isKeyboardButtonMoving) {
+                            // Match the menu path: focus the stream first, then defer the
+                            // toggle one frame so the IME binds to the stream, not the button.
+                            streamContainer.requestFocus();
+                            new Handler(Looper.getMainLooper()).post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    toggleKeyboard();
+                                }
+                            });
+                        }
+                        isKeyboardButtonMoving = false;
+                        return true;
+                    case MotionEvent.ACTION_CANCEL:
+                        isKeyboardButtonMoving = false;
+                        return true;
+                    default:
+                        return false;
+                }
+            });
+        }
+    }
+
+    private void updateKeyboardButtonVisibility(boolean show) {
+        if (floatingKeyboardButton != null) {
+            floatingKeyboardButton.setVisibility(show ? View.VISIBLE : View.GONE);
         }
     }
 
