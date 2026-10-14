@@ -219,6 +219,42 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private float lastAbsTouchUpX, lastAbsTouchUpY;
     private float lastAbsTouchDownX, lastAbsTouchDownY;
 
+    // --- Stylus UX: tremor damping + hold-still for right click ---
+    // Hold the pen still this long to get a right click, so a deliberate
+    // "press and wait" reads as right click while a moving pen stays a left drag.
+    private static final long STYLUS_LONG_PRESS_MS = 450;
+    // Slops are in dp, scaled per device so the pen behaves the same on any panel.
+    private float stylusSlopPx = 16f;
+    private boolean stylusSlopDpPending = true;
+    // Exponential smoothing for pen coordinates. 0 = raw (tremor passes through),
+    // 1 = frozen. 0.45 damps hand tremor while keeping strokes responsive.
+    private static final float STYLUS_SMOOTHING = 0.45f;
+    private int stylusSmoothPointerId = -1;
+    private float stylusSmoothX, stylusSmoothY;
+    private boolean stylusDown = false;
+    private boolean stylusLeftCommitted = false;
+    private boolean stylusRightFired = false;
+    private float stylusDownX, stylusDownY;
+    private float stylusCurX, stylusCurY;
+
+    private final Runnable stylusLongPressRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!stylusDown || stylusLeftCommitted || stylusRightFired) {
+                return;
+            }
+            float dx = stylusCurX - stylusDownX;
+            float dy = stylusCurY - stylusDownY;
+            if (dx * dx + dy * dy > stylusSlopPx * stylusSlopPx) {
+                return; // it moved: a drag, not a hold
+            }
+            // Held still: right click. No left button was ever sent, so there is
+            // no stray left click ahead of the context menu.
+            stylusRightFired = true;
+            conn.sendMouseButtonDown(MouseButtonPacket.BUTTON_RIGHT);
+        }
+    };
+
     private boolean quitOnStop = false;
     private boolean isHidingOverlays;
     private boolean floatingButtonShown;
@@ -2742,6 +2778,38 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         float[] normalizedCoords = getStreamViewRelativeNormalizedXY(view, event, pointerIndex);
         float[] normalizedContactArea = getStreamViewNormalizedContactArea(event, pointerIndex);
+        // Damp hand tremor on pen movement only; DOWN/UP stay verbatim so a click
+        // lands exactly where the pen lifted.
+        if (toolType == MoonBridge.LI_TOOL_TYPE_PEN || toolType == MoonBridge.LI_TOOL_TYPE_ERASER) {
+            if (eventType == MoonBridge.LI_TOUCH_EVENT_MOVE) {
+                int pid = event.getPointerId(pointerIndex);
+                if (pid != stylusSmoothPointerId) {
+                    stylusSmoothPointerId = pid;
+                    stylusSmoothX = normalizedCoords[0];
+                    stylusSmoothY = normalizedCoords[1];
+                } else {
+                    normalizedCoords[0] += (stylusSmoothX - normalizedCoords[0]) * STYLUS_SMOOTHING;
+                    normalizedCoords[1] += (stylusSmoothY - normalizedCoords[1]) * STYLUS_SMOOTHING;
+                    stylusSmoothX = normalizedCoords[0];
+                    stylusSmoothY = normalizedCoords[1];
+                }
+                // First real movement commits the left button, turning the press into
+                // a drag; a still pen never commits left, so hold-still = right click.
+                if (stylusDown && !stylusLeftCommitted && !stylusRightFired) {
+                    float dx = stylusCurX - stylusDownX;
+                    float dy = stylusCurY - stylusDownY;
+                    if (dx * dx + dy * dy > stylusSlopPx * stylusSlopPx) {
+                        stylusLeftCommitted = true;
+                        timerHandler.removeCallbacks(stylusLongPressRunnable);
+                        conn.sendMouseButtonDown(MouseButtonPacket.BUTTON_LEFT);
+                    }
+                }
+            } else {
+                stylusSmoothPointerId = event.getPointerId(pointerIndex);
+                stylusSmoothX = normalizedCoords[0];
+                stylusSmoothY = normalizedCoords[1];
+            }
+        }
         return conn.sendPenEvent(eventType, toolType, penButtons,
                 normalizedCoords[0], normalizedCoords[1],
                 getPressureOrDistance(event, pointerIndex),
@@ -2844,6 +2912,34 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     // Returns true if the event was consumed
     // NB: View is only present if called from a view callback
     public boolean handleMotionEvent(View view, MotionEvent event) {
+        // Scale stylus slops once per device from dp.
+        if (stylusSlopDpPending) {
+            stylusSlopDpPending = false;
+            float density = getResources().getDisplayMetrics().density;
+            stylusSlopPx = 16f * density;
+        }
+
+        // Suppress stylus hover: the pen reports HOVER_* whenever the tip is near
+        // the glass, which yanks the remote cursor before you actually touch down.
+        int stylusHoverAction = event.getActionMasked();
+        if (stylusHoverAction == MotionEvent.ACTION_HOVER_ENTER ||
+                stylusHoverAction == MotionEvent.ACTION_HOVER_MOVE ||
+                stylusHoverAction == MotionEvent.ACTION_HOVER_EXIT) {
+            if (event.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS ||
+                    event.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER) {
+                return true;
+            }
+        }
+
+        // Track live pen position so hold-to-right-click can tell a deliberate
+        // "hold still" from a drag.
+        if (event.getPointerCount() > 0) {
+            int penTool = event.getToolType(0);
+            if (penTool == MotionEvent.TOOL_TYPE_STYLUS || penTool == MotionEvent.TOOL_TYPE_ERASER) {
+                stylusCurX = event.getX(0);
+                stylusCurY = event.getY(0);
+            }
+        }
         // Pass through mouse/touch/joystick input if we're not grabbing
         if (!grabbedInput) {
             return false;
@@ -3118,8 +3214,16 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                             lastAbsTouchDownX = event.getX(0);
                             lastAbsTouchDownY = event.getY(0);
 
-                            // Stylus is left click
-                            conn.sendMouseButtonDown(MouseButtonPacket.BUTTON_LEFT);
+                            // Arm hold-to-right-click. The left button is NOT sent yet:
+                            // a still hold becomes a right click with no stray left click,
+                            // and any movement commits the left for dragging.
+                            stylusDown = true;
+                            stylusLeftCommitted = false;
+                            stylusRightFired = false;
+                            stylusDownX = stylusCurX = event.getX(0);
+                            stylusDownY = stylusCurY = event.getY(0);
+                            timerHandler.removeCallbacks(stylusLongPressRunnable);
+                            timerHandler.postDelayed(stylusLongPressRunnable, STYLUS_LONG_PRESS_MS);
                         } else if (event.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER) {
                             lastAbsTouchDownTime = event.getEventTime();
                             lastAbsTouchDownX = event.getX(0);
@@ -3135,8 +3239,21 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                             lastAbsTouchUpX = event.getX(0);
                             lastAbsTouchUpY = event.getY(0);
 
-                            // Stylus is left click
-                            conn.sendMouseButtonUp(MouseButtonPacket.BUTTON_LEFT);
+                            // Release whatever the press became: a fired hold drops the
+                            // right button, a drag drops the left, and a clean tap (no move,
+                            // no hold) sends a single left click.
+                            stylusDown = false;
+                            timerHandler.removeCallbacks(stylusLongPressRunnable);
+                            if (stylusRightFired) {
+                                stylusRightFired = false;
+                                conn.sendMouseButtonUp(MouseButtonPacket.BUTTON_RIGHT);
+                            } else if (stylusLeftCommitted) {
+                                stylusLeftCommitted = false;
+                                conn.sendMouseButtonUp(MouseButtonPacket.BUTTON_LEFT);
+                            } else {
+                                conn.sendMouseButtonDown(MouseButtonPacket.BUTTON_LEFT);
+                                conn.sendMouseButtonUp(MouseButtonPacket.BUTTON_LEFT);
+                            }
                         } else if (event.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER) {
                             lastAbsTouchUpTime = event.getEventTime();
                             lastAbsTouchUpX = event.getX(0);
